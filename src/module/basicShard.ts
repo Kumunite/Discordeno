@@ -1,12 +1,4 @@
-import {
-  connectWebSocket,
-  delay,
-  inflate,
-  isWebSocketCloseEvent,
-  isWebSocketPingEvent,
-  isWebSocketPongEvent,
-  WebSocket,
-} from "../../deps.ts";
+import { delay, inflate } from "../../deps.ts";
 import {
   DiscordBotGatewayData,
   DiscordHeartbeatPayload,
@@ -15,7 +7,12 @@ import {
 } from "../types/discord.ts";
 import { FetchMembersOptions } from "../types/guild.ts";
 import { BotStatusRequest } from "../utils/utils.ts";
-import { botGatewayData, eventHandlers, IdentifyPayload } from "./client.ts";
+import {
+  botGatewayData,
+  eventHandlers,
+  IdentifyPayload,
+  identifyPayload,
+} from "./client.ts";
 import { handleDiscordPayload } from "./shardingManager.ts";
 
 const basicShards = new Map<number, BasicShard>();
@@ -26,7 +23,7 @@ let processQueue = false;
 
 export interface BasicShard {
   id: number;
-  socket: WebSocket;
+  ws: WebSocket;
   resumeInterval: number;
   sessionID: string;
   previousSequenceNumber: number | null;
@@ -48,9 +45,10 @@ export async function createBasicShard(
 ) {
   const oldShard = basicShards.get(shardID);
 
+  const gatewayURL = `${data.url}?v=8&encoding=json`;
   const basicShard: BasicShard = {
     id: shardID,
-    socket: await connectWebSocket(`${data.url}?v=8&encoding=json`),
+    ws: new WebSocket(gatewayURL),
     resumeInterval: 0,
     sessionID: oldShard?.sessionID || "",
     previousSequenceNumber: oldShard?.previousSequenceNumber || 0,
@@ -59,114 +57,132 @@ export async function createBasicShard(
 
   basicShards.set(basicShard.id, basicShard);
 
-  if (!resuming) {
-    // Intial identify with the gateway
-    await identify(basicShard, identifyPayload);
-  } else {
-    await resume(basicShard, identifyPayload);
+  basicShard.ws.onopen = async () => {
+    if (!resuming) {
+      // Intial identify with the gateway
+      identify(basicShard, identifyPayload);
+    } else {
+      resume(basicShard, identifyPayload);
+    }
+  };
+
+  basicShard.ws.onclose = (closeEvent) =>
+    handleCloseEvent(shardID, basicShard, closeEvent);
+
+  basicShard.ws.onmessage = (messageEvent) =>
+    handleMessageEvent(shardID, basicShard, messageEvent);
+}
+
+function handleCloseEvent(
+  shardID: number,
+  basicShard: BasicShard,
+  closeEvent: CloseEvent,
+) {
+  eventHandlers.debug?.(
+    {
+      type: "wsClose",
+      data: { shardID: basicShard.id, event: closeEvent },
+    },
+  );
+
+  // These error codes should just crash the projects
+  if ([4004, 4005, 4012, 4013, 4014].includes(closeEvent.code)) {
+    eventHandlers.debug?.(
+      {
+        type: "wsError",
+        data: { shardID: basicShard.id, event: closeEvent },
+      },
+    );
+
+    throw new Error(
+      "Shard.ts: Error occurred that is not resumeable or able to be reconnected.",
+    );
   }
 
-  for await (let message of basicShard.socket) {
-    if (isWebSocketCloseEvent(message)) {
-      eventHandlers.debug?.(
-        { type: "websocketClose", data: { shardID: basicShard.id, message } },
-      );
+  // These error codes can not be resumed but need to reconnect from start
+  if ([4003, 4007, 4008, 4009].includes(closeEvent.code)) {
+    eventHandlers.debug?.(
+      {
+        type: "wsReconnect",
+        data: { shardID: basicShard.id, event: closeEvent },
+      },
+    );
+    createBasicShard(botGatewayData, identifyPayload, false, shardID);
+  } else {
+    basicShard.needToResume = true;
+    resumeConnection(botGatewayData, identifyPayload, basicShard.id);
+  }
+}
 
-      // These error codes should just crash the projects
-      if ([4004, 4005, 4012, 4013, 4014].includes(message.code)) {
-        console.error(`Close :( ${JSON.stringify(message)}`);
-        eventHandlers.debug?.(
-          {
-            type: "websocketErrored",
-            data: { shardID: basicShard.id, message },
-          },
-        );
+function handleMessageEvent(
+  shardID: number,
+  basicShard: BasicShard,
+  messageEvent: MessageEvent,
+) {
+  let message = messageEvent.data;
 
-        throw new Error(
-          "Shard.ts: Error occurred that is not resumeable or able to be reconnected.",
-        );
-      }
-      // These error codes can not be resumed but need to reconnect from start
-      if ([4003, 4007, 4008, 4009].includes(message.code)) {
+  if (message instanceof Uint8Array) {
+    message = inflate(
+      message,
+      0,
+      (slice: Uint8Array) => utf8decoder.decode(slice),
+    );
+  }
+
+  if (typeof message === "string") {
+    const data = JSON.parse(message);
+    if (!data.t) eventHandlers.rawGateway?.(data);
+    switch (data.op) {
+      case GatewayOpcode.Hello:
+        if (!heartbeating.has(basicShard.id)) {
+          heartbeat(
+            basicShard,
+            (data.d as DiscordHeartbeatPayload).heartbeat_interval,
+            identifyPayload,
+          );
+        }
+        break;
+      case GatewayOpcode.HeartbeatACK:
+        heartbeating.set(shardID, true);
+        break;
+      case GatewayOpcode.Reconnect:
         eventHandlers.debug?.(
-          {
-            type: "websocketReconnecting",
-            data: { shardID: basicShard.id, message },
-          },
+          { type: "reconnect", data: { shardID: basicShard.id } },
         );
-        createBasicShard(botGatewayData, identifyPayload, false, shardID);
-      } else {
         basicShard.needToResume = true;
         resumeConnection(botGatewayData, identifyPayload, basicShard.id);
-      }
-      continue;
-    } else if (isWebSocketPingEvent(message) || isWebSocketPongEvent(message)) {
-      continue;
-    }
-
-    if (message instanceof Uint8Array) {
-      message = inflate(
-        message,
-        0,
-        (slice: Uint8Array) => utf8decoder.decode(slice),
-      );
-    }
-
-    if (typeof message === "string") {
-      const data = JSON.parse(message);
-      if (!data.t) eventHandlers.rawGateway?.(data);
-      switch (data.op) {
-        case GatewayOpcode.Hello:
-          if (!heartbeating.has(basicShard.id)) {
-            heartbeat(
-              basicShard,
-              (data.d as DiscordHeartbeatPayload).heartbeat_interval,
-              identifyPayload,
-            );
-          }
+        break;
+      case GatewayOpcode.InvalidSession:
+        eventHandlers.debug?.(
+          { type: "invalidSession", data: { shardID: basicShard.id, data } },
+        );
+        // When d is false we need to reidentify
+        if (!data.d) {
+          createBasicShard(botGatewayData, identifyPayload, false, shardID);
           break;
-        case GatewayOpcode.HeartbeatACK:
-          heartbeating.set(shardID, true);
-          break;
-        case GatewayOpcode.Reconnect:
+        }
+        basicShard.needToResume = true;
+        resumeConnection(botGatewayData, identifyPayload, basicShard.id);
+        break;
+      default:
+        if (data.t === "RESUMED") {
           eventHandlers.debug?.(
-            { type: "reconnect", data: { shardID: basicShard.id } },
+            { type: "resumed", data: { shardID: basicShard.id } },
           );
-          basicShard.needToResume = true;
-          resumeConnection(botGatewayData, identifyPayload, basicShard.id);
-          break;
-        case GatewayOpcode.InvalidSession:
-          eventHandlers.debug?.(
-            { type: "invalidSession", data: { shardID: basicShard.id, data } },
-          );
-          // When d is false we need to reidentify
-          if (!data.d) {
-            createBasicShard(botGatewayData, identifyPayload, false, shardID);
-            break;
-          }
-          basicShard.needToResume = true;
-          resumeConnection(botGatewayData, identifyPayload, basicShard.id);
-          break;
-        default:
-          if (data.t === "RESUMED") {
-            eventHandlers.debug?.(
-              { type: "resumed", data: { shardID: basicShard.id } },
-            );
 
-            basicShard.needToResume = false;
-            break;
-          }
-          // Important for RESUME
-          if (data.t === "READY") {
-            basicShard.sessionID = (data.d as ReadyPayload).session_id;
-          }
-
-          // Update the sequence number if it is present
-          if (data.s) basicShard.previousSequenceNumber = data.s;
-
-          handleDiscordPayload(data, basicShard.id);
+          basicShard.needToResume = false;
           break;
-      }
+        }
+        // Important for RESUME
+        if (data.t === "READY") {
+          basicShard.sessionID = (data.d as ReadyPayload).session_id;
+        }
+
+        // Update the sequence number if it is present
+        if (data.s) basicShard.previousSequenceNumber = data.s;
+
+        handleDiscordPayload(data, basicShard.id);
+        break;
     }
   }
 }
@@ -181,7 +197,7 @@ function identify(shard: BasicShard, payload: IdentifyPayload) {
     },
   );
 
-  return shard.socket.send(
+  return shard.ws.send(
     JSON.stringify(
       {
         op: GatewayOpcode.Identify,
@@ -192,7 +208,7 @@ function identify(shard: BasicShard, payload: IdentifyPayload) {
 }
 
 function resume(shard: BasicShard, payload: IdentifyPayload) {
-  return shard.socket.send(JSON.stringify({
+  return shard.ws.send(JSON.stringify({
     op: GatewayOpcode.Resume,
     d: {
       token: payload.token,
@@ -208,7 +224,7 @@ async function heartbeat(
   payload: IdentifyPayload,
 ) {
   // We lost socket connection between heartbeats, resume connection
-  if (shard.socket.isClosed) {
+  if (shard.ws.readyState === WebSocket.CLOSED) {
     shard.needToResume = true;
     resumeConnection(botGatewayData, payload, shard.id);
     heartbeating.delete(shard.id);
@@ -229,14 +245,14 @@ async function heartbeat(
           },
         },
       );
-      return shard.socket.send(JSON.stringify({ op: 4009 }));
+      return shard.ws.send(JSON.stringify({ op: 4009 }));
     }
   }
 
   // Set it to false as we are issuing a new heartbeat
   heartbeating.set(shard.id, false);
 
-  shard.socket.send(
+  shard.ws.send(
     JSON.stringify(
       { op: GatewayOpcode.Heartbeat, d: shard.previousSequenceNumber },
     ),
@@ -304,12 +320,12 @@ export function requestGuildMembers(
   }
 
   // If its closed add back to queue to redo on resume
-  if (shard?.socket.isClosed) {
+  if (shard?.ws.readyState === WebSocket.CLOSED) {
     requestGuildMembers(guildID, shardID, nonce, options);
     return;
   }
 
-  shard?.socket.send(JSON.stringify({
+  shard?.ws.send(JSON.stringify({
     op: GatewayOpcode.RequestGuildMembers,
     d: {
       guild_id: guildID,
@@ -386,7 +402,7 @@ async function processGatewayQueue() {
 
 export function botGatewayStatusRequest(payload: BotStatusRequest) {
   basicShards.forEach((shard) => {
-    shard.socket.send(JSON.stringify({
+    shard.ws.send(JSON.stringify({
       op: GatewayOpcode.StatusUpdate,
       d: {
         since: null,

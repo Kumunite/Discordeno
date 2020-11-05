@@ -1,9 +1,4 @@
-import {
-  connectWebSocket,
-  delay,
-  isWebSocketCloseEvent,
-  WebSocket,
-} from "../../deps.ts";
+import { delay } from "../../deps.ts";
 import {
   DiscordBotGatewayData,
   DiscordHeartbeatPayload,
@@ -99,7 +94,7 @@ const createShard = async (
 ) => {
   postDebug({ type: "createShard", data: { shardID } });
 
-  shardSocket = await connectWebSocket(botGatewayData.url);
+  shardSocket = new WebSocket(botGatewayData.url);
   let resumeInterval = 0;
 
   if (!resuming) {
@@ -166,12 +161,12 @@ const createShard = async (
           break;
       }
     } else if (isWebSocketCloseEvent(message)) {
-      postDebug({ type: "websocketClose", data: { shardID, message } });
+      postDebug({ type: "wsClose", data: { shardID, message } });
 
       // These error codes should just crash the projects
       if ([4004, 4005, 4012, 4013, 4014].includes(message.code)) {
         console.error(`Close :( ${JSON.stringify(message)}`);
-        postDebug({ type: "websocketErrored", data: { shardID, message } });
+        postDebug({ type: "wsError", data: { shardID, message } });
 
         throw new Error(
           "Shard.ts: Error occurred that is not resumeable or able to be reconnected.",
@@ -180,7 +175,7 @@ const createShard = async (
       // These error codes can not be resumed but need to reconnect from start
       if ([4003, 4007, 4008, 4009].includes(message.code)) {
         postDebug(
-          { type: "websocketReconnecting", data: { shardID, message } },
+          { type: "wsReconnect", data: { shardID, message } },
         );
         createShard(botGatewayData, identifyPayload);
       } else {
@@ -271,6 +266,6 @@ onmessage = (message: MessageEvent) => {
 };
 
 function postDebug(details: DebugArg) {
-  // TODO: Errors need to be fixed by VSC plugin
+  // @ts-ignore Errors need to be fixed by VSC plugin
   postMessage({ type: "DEBUG_LOG", details });
 }
