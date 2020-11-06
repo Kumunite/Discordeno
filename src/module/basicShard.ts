@@ -6,6 +6,7 @@ import {
   ReadyPayload,
 } from "../types/discord.ts";
 import { FetchMembersOptions } from "../types/guild.ts";
+import { DiscordenoError } from "../utils/error.ts";
 import { BotStatusRequest } from "../utils/utils.ts";
 import {
   botGatewayData,
@@ -46,9 +47,12 @@ export async function createBasicShard(
   const oldShard = basicShards.get(shardID);
 
   const gatewayURL = `${data.url}?v=8&encoding=json`;
+  let connectedAt = Date.now();
+  const ws = new WebSocket(gatewayURL);
+
   const basicShard: BasicShard = {
     id: shardID,
-    ws: new WebSocket(gatewayURL),
+    ws,
     resumeInterval: 0,
     sessionID: oldShard?.sessionID || "",
     previousSequenceNumber: oldShard?.previousSequenceNumber || 0,
@@ -66,6 +70,16 @@ export async function createBasicShard(
     }
   };
 
+  basicShard.ws.onopen = () => {
+    eventHandlers.debug?.({
+      type: "wsOpen",
+      data: {
+        url: basicShard.ws.url,
+        timeTaken: Date.now() - connectedAt,
+      },
+    });
+  };
+
   basicShard.ws.onclose = (closeEvent) =>
     handleCloseEvent(shardID, basicShard, closeEvent);
 
@@ -76,37 +90,33 @@ export async function createBasicShard(
 function handleCloseEvent(
   shardID: number,
   basicShard: BasicShard,
-  closeEvent: CloseEvent,
+  { code, reason, wasClean }: CloseEvent,
 ) {
-  eventHandlers.debug?.(
-    {
-      type: "wsClose",
-      data: { shardID: basicShard.id, event: closeEvent },
-    },
-  );
+  eventHandlers.debug?.({
+    type: "wsClose",
+    data: { shardID: basicShard.id, code, reason, wasClean },
+  });
 
   // These error codes should just crash the projects
-  if ([4004, 4005, 4012, 4013, 4014].includes(closeEvent.code)) {
-    eventHandlers.debug?.(
-      {
-        type: "wsError",
-        data: { shardID: basicShard.id, event: closeEvent },
-      },
-    );
+  if ([4004, 4005, 4012, 4013, 4014].includes(code)) {
+    eventHandlers.debug?.({
+      type: "wsError",
+      data: { shardID: basicShard.id, code, reason, wasClean },
+    });
 
-    throw new Error(
-      "Shard.ts: Error occurred that is not resumeable or able to be reconnected.",
+    throw new DiscordenoError(
+      "Error occurred (connection is not resumeable or reconnectable)",
+      "ShardError",
     );
   }
 
   // These error codes can not be resumed but need to reconnect from start
-  if ([4003, 4007, 4008, 4009].includes(closeEvent.code)) {
-    eventHandlers.debug?.(
-      {
-        type: "wsReconnect",
-        data: { shardID: basicShard.id, event: closeEvent },
-      },
-    );
+  if ([4003, 4007, 4008, 4009].includes(code)) {
+    eventHandlers.debug?.({
+      type: "wsReconnect",
+      data: { shardID: basicShard.id, code, reason, wasClean },
+    });
+
     createBasicShard(botGatewayData, identifyPayload, false, shardID);
   } else {
     basicShard.needToResume = true;

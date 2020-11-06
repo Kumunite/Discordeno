@@ -70,6 +70,7 @@ export interface DebugArg {
     | "reconnect"
     | "resuming"
     | "resumed"
+    | "wsOpen"
     | "wsClose"
     | "wsError"
     | "wsReconnect"
